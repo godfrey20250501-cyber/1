@@ -164,7 +164,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/兌換試算` 試算代幣可換多少遊戲幣。\n"
         "`/兌換申請` 建立申請；主辦方在外部付款／發幣後使用 `/兌換完成`。\n"
         "管理員可用 `/抽獎設定` 指定本伺服器可參加抽獎的身分組，`/抽獎設定查看` 可查看設定。\n"
-        "`/抽獎開始` 建立抽獎貼文，使用按鈕參加、查看名單、開獎或取消；`/抽獎加入` 可由主辦方直接加入成員。\n"
+        "`/抽獎開始` 建立抽獎貼文，使用按鈕參加、查看名單、開獎或取消；`/抽獎列表` 可查編號；`/抽獎加入` 可由主辦方直接加入成員。\n"
         "`/捐贈` 可自選代幣捐入抽獎池，降低主辦方外部付款成本。\n"
         "代幣僅是本伺服器內的活動點數，不具有現金價值，不可提現。"
     )
@@ -290,7 +290,9 @@ class LotteryView(discord.ui.View):
             await interaction.response.send_message("只有主辦方或管理員可以取消抽獎。", ephemeral=True); return
         with DB_LOCK, db() as c:
             result = c.execute("UPDATE lotteries SET status='cancelled' WHERE id=? AND guild_id=? AND status='open'", (self.lottery_id, interaction.guild_id)).rowcount
-        await interaction.response.send_message("抽獎已取消。" if result else "抽獎已經結束或取消。")
+        if not result:
+            await interaction.response.send_message("抽獎已經結束或取消。", ephemeral=True); return
+        await interaction.response.edit_message(content="已取消", embed=None, view=None)
 
 async def draw_lottery(lottery_id, guild_id):
     with DB_LOCK, db() as c:
@@ -318,10 +320,20 @@ async def lottery_cmd(interaction: discord.Interaction, 代幣總額: int, 得�
     with DB_LOCK, db() as c:
         cur = c.execute("INSERT INTO lotteries(guild_id,organizer_id,pool,winners,description,created_at,status,channel_id) VALUES(?,?,?,?,?,?,?,?)", (interaction.guild_id, interaction.user.id, pool, winners, 說明[:200], datetime.now(timezone.utc).isoformat(), "open", interaction.channel_id))
         lottery_id = cur.lastrowid
-    embed = discord.Embed(title="🎁 抽獎！", description=f"**獎池：** {pool} 枚代幣\n**得主數：** {winners} 人\n**說明：** {說明[:200] or '無'}\n\n按下「參加」加入抽獎池；主辦方可直接加入成員或接受代幣捐贈。", color=0xE91E63)
+    embed = discord.Embed(title=f"🎁 抽獎 #{lottery_id}", description=f"**抽獎編號：** `{lottery_id}`\n**獎池：** {pool} 枚代幣\n**得主數：** {winners} 人\n**說明：** {說明[:200] or '無'}\n\n按下「參加」加入抽獎池；主辦方可直接加入成員或接受代幣捐贈。", color=0xE91E63)
     await interaction.response.send_message(embed=embed, view=LotteryView(lottery_id))
     message = await interaction.original_response()
     with DB_LOCK, db() as c: c.execute("UPDATE lotteries SET message_id=? WHERE id=?", (message.id, lottery_id))
+
+@bot.tree.command(name="抽獎列表", description="查看本伺服器進行中的抽獎編號", **command_guild())
+async def lottery_list(interaction: discord.Interaction):
+    with DB_LOCK, db() as c:
+        rows = c.execute("SELECT id,pool,winners,description FROM lotteries WHERE guild_id=? AND status='open' ORDER BY id DESC LIMIT 20", (interaction.guild_id,)).fetchall()
+        counts = {r["id"]: r["count"] for r in c.execute("SELECT lottery_id,COUNT(*) AS count FROM lottery_entries GROUP BY lottery_id").fetchall()}
+    if not rows:
+        await interaction.response.send_message("本伺服器目前沒有進行中的抽獎。", ephemeral=True); return
+    text = "\n".join(f"`#{r['id']}`：獎池 {r['pool']} 代幣、得主 {r['winners']} 人、參加 {counts.get(r['id'], 0)} 人、{r['description'] or '無說明'}" for r in rows)
+    await interaction.response.send_message("**進行中的抽獎**\n" + text, ephemeral=True)
 
 @bot.tree.command(name="抽獎加入", description="主辦方直接把成員加入抽獎池", **command_guild())
 async def lottery_add(interaction: discord.Interaction, 抽獎編號: int, 成員: discord.Member):
