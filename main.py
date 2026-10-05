@@ -18,6 +18,7 @@ TOKEN = os.getenv("TOKEN_BOT_DISCORD_TOKEN", "").strip()
 DB_FILE = os.getenv("TOKEN_BOT_DB_FILE", "token_bot.db")
 GUILD_ID = int(os.getenv("TOKEN_BOT_GUILD_ID", "0") or 0)
 ORGANIZER_ROLE_ID = int(os.getenv("TOKEN_BOT_ORGANIZER_ROLE_ID", "0") or 0)
+ENTRY_ROLE_ID = int(os.getenv("TOKEN_BOT_ENTRY_ROLE_ID", "0") or 0)
 
 if not TOKEN:
     raise SystemExit("TOKEN_BOT_DISCORD_TOKEN 未設定")
@@ -70,6 +71,12 @@ def init_db():
             user_id INTEGER NOT NULL, added_by INTEGER NOT NULL,
             created_at TEXT NOT NULL, PRIMARY KEY (lottery_id, user_id)
         );
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id INTEGER PRIMARY KEY,
+            entry_role_id INTEGER NOT NULL DEFAULT 0,
+            updated_by INTEGER,
+            updated_at TEXT NOT NULL
+        );
         """)
         columns = {row["name"] for row in c.execute("PRAGMA table_info(lotteries)").fetchall()}
         if "status" not in columns: c.execute("ALTER TABLE lotteries ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
@@ -83,6 +90,16 @@ def is_organizer(interaction):
     if is_admin(interaction):
         return True
     return bool(ORGANIZER_ROLE_ID and any(r.id == ORGANIZER_ROLE_ID for r in getattr(interaction.user, "roles", [])))
+
+def get_entry_role_id(guild_id):
+    with DB_LOCK, db() as c:
+        row = c.execute("SELECT entry_role_id FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    return row["entry_role_id"] if row else ENTRY_ROLE_ID
+
+def can_enter_lottery(guild_id, member):
+    """每個伺服器可獨立設定；0 代表不限制參加身分組。"""
+    role_id = get_entry_role_id(guild_id)
+    return not role_id or any(role.id == role_id for role in getattr(member, "roles", []))
 
 def require_guild(interaction):
     return interaction.guild_id is not None
@@ -146,6 +163,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/匯率` 查看本伺服器匯率。\n"
         "`/兌換試算` 試算代幣可換多少遊戲幣。\n"
         "`/兌換申請` 建立申請；主辦方在外部付款／發幣後使用 `/兌換完成`。\n"
+        "管理員可用 `/抽獎設定` 指定本伺服器可參加抽獎的身分組，`/抽獎設定查看` 可查看設定。\n"
         "`/抽獎開始` 建立抽獎貼文，使用按鈕參加、查看名單、開獎或取消；`/抽獎加入` 可由主辦方直接加入成員。\n"
         "`/捐贈` 可自選代幣捐入抽獎池，降低主辦方外部付款成本。\n"
         "代幣僅是本伺服器內的活動點數，不具有現金價值，不可提現。"
@@ -160,6 +178,21 @@ async def calculate_cmd(interaction: discord.Interaction, 算式: str):
         await interaction.response.send_message("算式無效；只支援數字、括號與 + - * / // %。", ephemeral=True)
         return
     await interaction.response.send_message(f"`{算式}` = **{result:g}**", ephemeral=True)
+
+@bot.tree.command(name="抽獎設定", description="設定本伺服器可參加抽獎的身分組", **command_guild())
+@app_commands.describe(參加身分組="只有擁有此身分組的成員可以按參加或被加入抽獎池")
+async def lottery_settings(interaction: discord.Interaction, 參加身分組: discord.Role):
+    if not is_admin(interaction):
+        await interaction.response.send_message("只有伺服器管理員可以設定抽獎參加身分組。", ephemeral=True); return
+    with DB_LOCK, db() as c:
+        c.execute("INSERT INTO guild_settings(guild_id,entry_role_id,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET entry_role_id=excluded.entry_role_id,updated_by=excluded.updated_by,updated_at=excluded.updated_at", (interaction.guild_id, 參加身分組.id, interaction.user.id, datetime.now(timezone.utc).isoformat()))
+    await interaction.response.send_message(f"本伺服器抽獎參加身分組已設定為 {參加身分組.mention}。其他伺服器可各自使用 `/抽獎設定`，互不影響。", ephemeral=True)
+
+@bot.tree.command(name="抽獎設定查看", description="查看本伺服器的抽獎參加身分組", **command_guild())
+async def lottery_settings_view(interaction: discord.Interaction):
+    role_id = get_entry_role_id(interaction.guild_id)
+    text = "未限制參加身分組，所有非機器人會員都可以參加。" if not role_id else f"本伺服器目前只有 <@&{role_id}> 可以參加抽獎。"
+    await interaction.response.send_message(text, ephemeral=True)
 
 @bot.tree.command(name="代幣", description="查看自己或指定成員的代幣餘額", **command_guild())
 @app_commands.describe(成員="可選；管理員可查詢其他成員")
@@ -225,6 +258,8 @@ class LotteryView(discord.ui.View):
 
     @discord.ui.button(label="參加", style=discord.ButtonStyle.success, custom_id="token_lottery_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_enter_lottery(interaction.guild_id, interaction.user):
+            await interaction.response.send_message("你沒有指定的抽獎參加身分組，無法加入抽獎池。", ephemeral=True); return
         with DB_LOCK, db() as c:
             lottery = c.execute("SELECT * FROM lotteries WHERE id=? AND guild_id=?", (self.lottery_id, interaction.guild_id)).fetchone()
             if not lottery or lottery["status"] != "open":
@@ -292,6 +327,8 @@ async def lottery_cmd(interaction: discord.Interaction, 代幣總額: int, 得�
 async def lottery_add(interaction: discord.Interaction, 抽獎編號: int, 成員: discord.Member):
     if not is_organizer(interaction):
         await interaction.response.send_message("只有主辦方或管理員可以直接加入成員。", ephemeral=True); return
+    if not can_enter_lottery(interaction.guild_id, 成員):
+        await interaction.response.send_message("該成員沒有指定的抽獎參加身分組，不能加入抽獎池。", ephemeral=True); return
     with DB_LOCK, db() as c:
         lottery = c.execute("SELECT status FROM lotteries WHERE id=? AND guild_id=?", (抽獎編號, interaction.guild_id)).fetchone()
         if not lottery or lottery["status"] != "open": msg = "找不到進行中的抽獎。"
